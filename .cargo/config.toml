@@ -1,0 +1,17 @@
+[build]
+target = "riscv32imafc-unknown-none-elf"
+
+[target.riscv32imafc-unknown-none-elf]
+runner = [
+    "probe-rs",
+    "download",
+    "--chip",
+    "HPM5301",
+    "--protocol",
+    "jtag",
+    "--speed",
+    "4000",
+]
+rustflags = [
+    "-C", "target-feature=+zba,+zbb,+zbc,+zbs",
+]

@@ -1,0 +1,21 @@
+[package]
+name = "yblink"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[[bin]]
+name = "yblink"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+embassy-executor = { workspace = true, features = ["platform-riscv32", "executor-thread"] }
+embassy-futures = { workspace = true }
+embassy-time = { workspace = true }
+embassy-usb = { workspace = true }
+hpm5301_hal = { workspace = true }
+panic-halt = { workspace = true }
+riscv = { workspace = true, features = ["critical-section-single-hart"] }
+riscv-rt = { workspace = true, features = ["single-hart", "pre-init"] }

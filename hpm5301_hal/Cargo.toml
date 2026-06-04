@@ -1,0 +1,14 @@
+[package]
+name = "hpm5301_hal"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+test = false
+bench = false
+
+[dependencies]
+embassy-time-driver = { workspace = true }
+embassy-usb-driver = { workspace = true }
+embedded-hal = { workspace = true }
+hpm5301_pac = { workspace = true, features = ["critical-section"] }
