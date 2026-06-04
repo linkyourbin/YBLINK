@@ -1,6 +1,6 @@
 # YBLINK HPM5301 Firmware
 
-YBLINK is a pure-Rust CMSIS-DAP v2 probe firmware for HPM5301. The stable build
+Yet Better Link(YBLINK) is a pure-Rust CMSIS-DAP v2 probe firmware for HPM5301. The stable build
 uses USB high speed, FGPIO bit-banged SWD/JTAG, and a CDC ACM USB-to-UART bridge.
 
 Current stable USB identity:
