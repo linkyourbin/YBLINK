@@ -66,8 +66,8 @@ cargo build -p yblink --release
 
 ## Customized Board
 
-<img src="hardware_altium_project/front.jpg" width="48%">
-<img src="hardware_altium_project/back.jpg" width="48%">
+| <img src="hardware_altium_project/front.jpg" width="480"> | <img src="hardware_altium_project/back.jpg" width="480"> |
+| :-----------------------------------------------------: | :-----------------------------------------------------: |
 
 A customized board is also hand-soldered and tested ok, and you can find the `sch`, `pcb` and gerber file in [hardware_altium_project](hardware_altium_project) directory. The five vias are for flashing the firmware(left to the right order). 
 
