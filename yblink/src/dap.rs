@@ -2,7 +2,8 @@ use hpm5301_hal::time;
 
 use crate::swj::{Port, ProbeIo, Swj, TransferStatus};
 
-pub const PACKET_SIZE: usize = 512;
+pub const PACKET_SIZE: usize = 8192;
+pub const PACKET_COUNT: usize = 2;
 pub const DAP_VENDOR: &str = "linkyourbin";
 pub const DAP_PRODUCT: &str = "YBLINK CMSIS-DAP";
 pub const DAP_SERIAL: &str = "YBLINK";
@@ -14,6 +15,41 @@ pub const DAP_PRODUCT_FW_VERSION: &str = "0.1.0";
 pub static mut YBLINK_DAP_TRACE: [u32; 1024] = [0; 1024];
 static mut DAP_TRACE_INDEX: u32 = 0;
 const ENABLE_DAP_TRACE: bool = false;
+
+#[unsafe(no_mangle)]
+#[used]
+pub static mut YBLINK_DAP_COUNTERS: [u32; 64] = [0; 64];
+const ENABLE_DAP_COUNTERS: bool = false;
+
+const CTR_PROCESS_CALLS: usize = 0;
+const CTR_USB_BYTES_IN: usize = 1;
+const CTR_USB_BYTES_OUT: usize = 2;
+const CTR_EXECUTE_WRAPPERS: usize = 3;
+const CTR_EXECUTE_SUBCOMMANDS: usize = 4;
+const CTR_TRANSFER_CMDS: usize = 5;
+const CTR_TRANSFER_ITEMS: usize = 6;
+const CTR_TRANSFER_SINGLE_WRITES: usize = 7;
+const CTR_TRANSFER_SINGLE_READS: usize = 8;
+const CTR_TRANSFER_MATCH_READS: usize = 9;
+const CTR_TRANSFER_POST_RDBUFF: usize = 10;
+const CTR_TRANSFER_BLOCK_CMDS: usize = 11;
+const CTR_BLOCK_WRITE_CMDS: usize = 12;
+const CTR_BLOCK_WRITE_WORDS_REQUESTED: usize = 13;
+const CTR_BLOCK_WRITE_WORDS_DONE: usize = 14;
+const CTR_BLOCK_READ_CMDS: usize = 15;
+const CTR_BLOCK_READ_WORDS_REQUESTED: usize = 16;
+const CTR_BLOCK_READ_WORDS_DONE: usize = 17;
+const CTR_SWD_RETRY_CALLS: usize = 18;
+const CTR_SWD_WAIT_RETRIES: usize = 19;
+const CTR_SWD_NON_OK: usize = 20;
+const CTR_BLOCK_WRITE_AP_CMDS: usize = 21;
+const CTR_BLOCK_WRITE_DP_CMDS: usize = 22;
+const CTR_BLOCK_READ_AP_CMDS: usize = 23;
+const CTR_BLOCK_READ_DP_CMDS: usize = 24;
+const CTR_BLOCK_NON_OK: usize = 25;
+const CTR_TRANSFER_NON_OK: usize = 26;
+const CTR_TRANSFER_REQ_HIST_BASE: usize = 32;
+const CTR_BLOCK_REQ_HIST_BASE: usize = 48;
 
 const DAP_OK: u8 = 0x00;
 const DAP_ERROR: u8 = 0xff;
@@ -29,7 +65,8 @@ const DAP_TRANSFER_RNW: u8 = 1 << 1;
 const DAP_TRANSFER_MATCH_VALUE: u8 = 1 << 4;
 const DAP_TRANSFER_MATCH_MASK: u8 = 1 << 5;
 const DP_RDBUFF_READ: u8 = 0x0e;
-const CHECK_POSTED_WRITES: bool = true;
+const CHECK_POSTED_WRITES: bool = false;
+const CHECK_BLOCK_POSTED_WRITES: bool = false;
 const JTAG_DEV_MAX: usize = 8;
 const JTAG_ABORT: u8 = 0x08;
 const JTAG_DPACC: u8 = 0x0a;
@@ -94,10 +131,15 @@ impl<P: ProbeIo> Dap<P> {
         }
     }
 
-    pub fn process(&mut self, request: &[u8], response: &mut [u8; PACKET_SIZE]) -> usize {
+    pub fn process(&mut self, request: &[u8], response: &mut [u8]) -> usize {
         let Some(&command) = request.first() else {
             return 0;
         };
+        if response.is_empty() {
+            return 0;
+        }
+        counter_add(CTR_PROCESS_CALLS, 1);
+        counter_add(CTR_USB_BYTES_IN, request.len() as u32);
         response[0] = command;
 
         let response_len = match command {
@@ -208,10 +250,11 @@ impl<P: ProbeIo> Dap<P> {
         };
 
         trace_command(command, request, response, response_len);
+        counter_add(CTR_USB_BYTES_OUT, response_len as u32);
         response_len
     }
 
-    fn dap_info(&mut self, request: &[u8], response: &mut [u8; PACKET_SIZE]) -> usize {
+    fn dap_info(&mut self, request: &[u8], response: &mut [u8]) -> usize {
         let Some(&info) = request.get(1) else {
             response[1] = 0;
             return 2;
@@ -225,7 +268,7 @@ impl<P: ProbeIo> Dap<P> {
             0x04 => info_str(response, DAP_FW_VERSION),
             0x09 => info_str(response, DAP_PRODUCT_FW_VERSION),
             0xf0 => info_capabilities(response),
-            0xfe => info_u8(response, 1),
+            0xfe => info_u8(response, PACKET_COUNT as u8),
             0xff => info_u16(response, PACKET_SIZE as u16),
             0xfb | 0xfc | 0xfd => info_u32(response, 0),
             _ => {
@@ -235,7 +278,7 @@ impl<P: ProbeIo> Dap<P> {
         }
     }
 
-    fn connect(&mut self, request: &[u8], response: &mut [u8; PACKET_SIZE]) -> usize {
+    fn connect(&mut self, request: &[u8], response: &mut [u8]) -> usize {
         let requested = request.get(1).copied().unwrap_or(0);
         self.port = match requested {
             0 | 1 => Port::Swd,
@@ -247,7 +290,7 @@ impl<P: ProbeIo> Dap<P> {
         2
     }
 
-    fn swj_pins(&mut self, request: &[u8], response: &mut [u8; PACKET_SIZE]) -> usize {
+    fn swj_pins(&mut self, request: &[u8], response: &mut [u8]) -> usize {
         if request.len() < 7 {
             response[1] = 0;
             return 2;
@@ -273,7 +316,7 @@ impl<P: ProbeIo> Dap<P> {
         2
     }
 
-    fn execute_commands(&mut self, request: &[u8], response: &mut [u8; PACKET_SIZE]) -> usize {
+    fn execute_commands(&mut self, request: &[u8], response: &mut [u8]) -> usize {
         if request.len() < 2 {
             response[0] = ID_DAP_EXECUTE_COMMANDS;
             response[1] = 0;
@@ -281,6 +324,8 @@ impl<P: ProbeIo> Dap<P> {
         }
 
         let requested = request[1] as usize;
+        counter_add(CTR_EXECUTE_WRAPPERS, 1);
+        counter_add(CTR_EXECUTE_SUBCOMMANDS, requested as u32);
         let mut input = 2;
         let mut output = 2;
         let mut executed = 0usize;
@@ -288,7 +333,7 @@ impl<P: ProbeIo> Dap<P> {
         response[0] = ID_DAP_EXECUTE_COMMANDS;
 
         for _ in 0..requested {
-            if input >= request.len() || output >= PACKET_SIZE {
+            if input >= request.len() || output >= response.len() {
                 break;
             }
 
@@ -303,13 +348,13 @@ impl<P: ProbeIo> Dap<P> {
                 break;
             }
 
-            let mut sub_response = [0u8; PACKET_SIZE];
-            let response_len =
-                self.process(&request[input..input + request_len], &mut sub_response);
-            if output + response_len > PACKET_SIZE {
+            let response_len = self.process(
+                &request[input..input + request_len],
+                &mut response[output..],
+            );
+            if response_len == 0 {
                 break;
             }
-            response[output..output + response_len].copy_from_slice(&sub_response[..response_len]);
 
             input += request_len;
             output += response_len;
@@ -320,7 +365,7 @@ impl<P: ProbeIo> Dap<P> {
         output
     }
 
-    fn swj_sequence(&mut self, request: &[u8], response: &mut [u8; PACKET_SIZE]) -> usize {
+    fn swj_sequence(&mut self, request: &[u8], response: &mut [u8]) -> usize {
         let Some(&count_byte) = request.get(1) else {
             response[1] = DAP_ERROR;
             return 2;
@@ -341,7 +386,7 @@ impl<P: ProbeIo> Dap<P> {
         2
     }
 
-    fn swd_sequence(&mut self, request: &[u8], response: &mut [u8; PACKET_SIZE]) -> usize {
+    fn swd_sequence(&mut self, request: &[u8], response: &mut [u8]) -> usize {
         if self.port != Port::Swd || request.len() < 2 {
             response[1] = DAP_ERROR;
             return 2;
@@ -368,7 +413,7 @@ impl<P: ProbeIo> Dap<P> {
             let read = info & 0x80 != 0;
 
             if read {
-                if output + byte_count > PACKET_SIZE {
+                if output + byte_count > response.len() {
                     response[1] = DAP_ERROR;
                     return 2;
                 }
@@ -388,7 +433,7 @@ impl<P: ProbeIo> Dap<P> {
         output
     }
 
-    fn swo_transport(&mut self, request: &[u8], response: &mut [u8; PACKET_SIZE]) -> usize {
+    fn swo_transport(&mut self, request: &[u8], response: &mut [u8]) -> usize {
         match request.get(1).copied().unwrap_or(0) {
             0 | 1 => response[1] = DAP_OK,
             _ => response[1] = DAP_ERROR,
@@ -396,7 +441,7 @@ impl<P: ProbeIo> Dap<P> {
         2
     }
 
-    fn jtag_configure(&mut self, request: &[u8], response: &mut [u8; PACKET_SIZE]) -> usize {
+    fn jtag_configure(&mut self, request: &[u8], response: &mut [u8]) -> usize {
         let Some(&count) = request.get(1) else {
             response[1] = DAP_ERROR;
             return 2;
@@ -441,7 +486,7 @@ impl<P: ProbeIo> Dap<P> {
         2
     }
 
-    fn jtag_idcode(&mut self, request: &[u8], response: &mut [u8; PACKET_SIZE]) -> usize {
+    fn jtag_idcode(&mut self, request: &[u8], response: &mut [u8]) -> usize {
         let Some(&index) = request.get(1) else {
             response[1] = DAP_ERROR;
             return 2;
@@ -458,7 +503,7 @@ impl<P: ProbeIo> Dap<P> {
         6
     }
 
-    fn jtag_sequence(&mut self, request: &[u8], response: &mut [u8; PACKET_SIZE]) -> usize {
+    fn jtag_sequence(&mut self, request: &[u8], response: &mut [u8]) -> usize {
         let Some(&sequence_count) = request.get(1) else {
             response[1] = DAP_ERROR;
             return 2;
@@ -479,7 +524,7 @@ impl<P: ProbeIo> Dap<P> {
                 n => n as usize,
             };
             let byte_count = bit_count.div_ceil(8);
-            if request.len() < input + byte_count || output + byte_count > PACKET_SIZE {
+            if request.len() < input + byte_count || output + byte_count > response.len() {
                 response[1] = DAP_ERROR;
                 return 2;
             }
@@ -508,7 +553,7 @@ impl<P: ProbeIo> Dap<P> {
 
     #[inline(never)]
     #[unsafe(link_section = ".fast")]
-    fn transfer(&mut self, request: &[u8], response: &mut [u8; PACKET_SIZE]) -> usize {
+    fn transfer(&mut self, request: &[u8], response: &mut [u8]) -> usize {
         if request.len() < 3 {
             response[1] = 0;
             response[2] = DAP_TRANSFER_ERROR;
@@ -526,6 +571,8 @@ impl<P: ProbeIo> Dap<P> {
         }
 
         let transfer_count = request[2] as usize;
+        counter_add(CTR_TRANSFER_CMDS, 1);
+        counter_add(CTR_TRANSFER_ITEMS, transfer_count as u32);
         let mut input = 3;
         let mut output = 3;
         let mut done = 0u8;
@@ -539,8 +586,13 @@ impl<P: ProbeIo> Dap<P> {
                 break;
             };
             input += 1;
+            counter_add(
+                CTR_TRANSFER_REQ_HIST_BASE + (dap_request & 0x0f) as usize,
+                1,
+            );
 
             if dap_request & DAP_TRANSFER_RNW != 0 {
+                counter_add(CTR_TRANSFER_SINGLE_READS, 1);
                 if post_read {
                     let result = if (dap_request & (DAP_TRANSFER_APNDP | DAP_TRANSFER_MATCH_VALUE))
                         == DAP_TRANSFER_APNDP
@@ -550,11 +602,16 @@ impl<P: ProbeIo> Dap<P> {
                         post_read = false;
                         self.swd_transfer_with_retry(DP_RDBUFF_READ, 0)
                     };
+                    if (dap_request & (DAP_TRANSFER_APNDP | DAP_TRANSFER_MATCH_VALUE))
+                        != DAP_TRANSFER_APNDP
+                    {
+                        counter_add(CTR_TRANSFER_POST_RDBUFF, 1);
+                    }
                     status = transfer_status(result.status);
                     if status != DAP_TRANSFER_OK {
                         break;
                     }
-                    if output + 4 > PACKET_SIZE {
+                    if output + 4 > response.len() {
                         status = DAP_TRANSFER_ERROR;
                         break;
                     }
@@ -570,6 +627,7 @@ impl<P: ProbeIo> Dap<P> {
                     };
                     input += 4;
                     let target = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    counter_add(CTR_TRANSFER_MATCH_READS, 1);
 
                     if dap_request & DAP_TRANSFER_APNDP != 0 {
                         let result = self.swd_transfer_with_retry(dap_request, 0);
@@ -615,7 +673,7 @@ impl<P: ProbeIo> Dap<P> {
                     if status != DAP_TRANSFER_OK {
                         break;
                     }
-                    if output + 4 > PACKET_SIZE {
+                    if output + 4 > response.len() {
                         status = DAP_TRANSFER_ERROR;
                         break;
                     }
@@ -627,11 +685,12 @@ impl<P: ProbeIo> Dap<P> {
             } else {
                 if post_read {
                     let result = self.swd_transfer_with_retry(DP_RDBUFF_READ, 0);
+                    counter_add(CTR_TRANSFER_POST_RDBUFF, 1);
                     status = transfer_status(result.status);
                     if status != DAP_TRANSFER_OK {
                         break;
                     }
-                    if output + 4 > PACKET_SIZE {
+                    if output + 4 > response.len() {
                         status = DAP_TRANSFER_ERROR;
                         break;
                     }
@@ -654,6 +713,7 @@ impl<P: ProbeIo> Dap<P> {
                     status = DAP_TRANSFER_OK;
                     check_write = false;
                 } else {
+                    counter_add(CTR_TRANSFER_SINGLE_WRITES, 1);
                     let result = self.swd_transfer_with_retry(dap_request, write_data);
                     status = transfer_status(result.status);
                     if status != DAP_TRANSFER_OK {
@@ -669,8 +729,9 @@ impl<P: ProbeIo> Dap<P> {
         if status == DAP_TRANSFER_OK {
             if post_read {
                 let result = self.swd_transfer_with_retry(DP_RDBUFF_READ, 0);
+                counter_add(CTR_TRANSFER_POST_RDBUFF, 1);
                 status = transfer_status(result.status);
-                if status == DAP_TRANSFER_OK && output + 4 <= PACKET_SIZE {
+                if status == DAP_TRANSFER_OK && output + 4 <= response.len() {
                     response[output..output + 4].copy_from_slice(&result.data.to_le_bytes());
                     trace_event(0x4811_0005, done as u32, DP_RDBUFF_READ as u32, result.data);
                     output += 4;
@@ -686,12 +747,15 @@ impl<P: ProbeIo> Dap<P> {
 
         response[1] = done;
         response[2] = status;
+        if status != DAP_TRANSFER_OK {
+            counter_add(CTR_TRANSFER_NON_OK, 1);
+        }
         output
     }
 
     #[inline(never)]
     #[unsafe(link_section = ".fast")]
-    fn transfer_block(&mut self, request: &[u8], response: &mut [u8; PACKET_SIZE]) -> usize {
+    fn transfer_block(&mut self, request: &[u8], response: &mut [u8]) -> usize {
         if request.len() < 5 {
             response[1] = 0;
             response[2] = 0;
@@ -713,6 +777,8 @@ impl<P: ProbeIo> Dap<P> {
         let transfer_count = u16::from_le_bytes([request[2], request[3]]) as usize;
         let dap_request = request[4];
         let is_read = dap_request & DAP_TRANSFER_RNW != 0;
+        counter_add(CTR_TRANSFER_BLOCK_CMDS, 1);
+        counter_add(CTR_BLOCK_REQ_HIST_BASE + (dap_request & 0x0f) as usize, 1);
         let input = 5;
         let mut output = 4;
         let mut done = 0usize;
@@ -737,9 +803,15 @@ impl<P: ProbeIo> Dap<P> {
         } else if dap_request & (DAP_TRANSFER_MATCH_VALUE | DAP_TRANSFER_MATCH_MASK) != 0 {
             status = DAP_TRANSFER_ERROR;
         } else if is_read {
-            let mut request_value = dap_request;
-            if request_value & DAP_TRANSFER_APNDP != 0 {
-                let result = self.swd_transfer_with_retry(request_value, 0);
+            counter_add(CTR_BLOCK_READ_CMDS, 1);
+            counter_add(CTR_BLOCK_READ_WORDS_REQUESTED, transfer_count as u32);
+            if dap_request & DAP_TRANSFER_APNDP != 0 {
+                counter_add(CTR_BLOCK_READ_AP_CMDS, 1);
+            } else {
+                counter_add(CTR_BLOCK_READ_DP_CMDS, 1);
+            }
+            if dap_request & DAP_TRANSFER_APNDP != 0 {
+                let result = self.swd_transfer_with_retry(dap_request, 0);
                 status = transfer_status(result.status);
                 if status != DAP_TRANSFER_OK {
                     response[1..3].copy_from_slice(&(done as u16).to_le_bytes());
@@ -748,26 +820,61 @@ impl<P: ProbeIo> Dap<P> {
                 }
             }
 
-            while done < transfer_count {
-                if done + 1 == transfer_count && dap_request & DAP_TRANSFER_APNDP != 0 {
-                    request_value = DP_RDBUFF_READ;
+            if dap_request & DAP_TRANSFER_APNDP != 0 {
+                if transfer_count > 1 {
+                    let ap_count = transfer_count - 1;
+                    let byte_count = ap_count.saturating_mul(4);
+                    if output + byte_count > response.len() {
+                        status = DAP_TRANSFER_ERROR;
+                    } else {
+                        let result = self.swj.swd_read_block(
+                            dap_request,
+                            &mut response[output..output + byte_count],
+                            ap_count,
+                            self.wait_retries,
+                        );
+                        done += result.done;
+                        status = transfer_status(result.status);
+                        output += result.done * 4;
+                    }
                 }
 
-                let result = self.swd_transfer_with_retry(request_value, 0);
-                status = transfer_status(result.status);
-                if status != DAP_TRANSFER_OK {
-                    break;
+                if status == DAP_TRANSFER_OK {
+                    let result = self.swd_transfer_with_retry(DP_RDBUFF_READ, 0);
+                    status = transfer_status(result.status);
+                    if status == DAP_TRANSFER_OK && output + 4 <= response.len() {
+                        response[output..output + 4].copy_from_slice(&result.data.to_le_bytes());
+                        trace_event(0x4800_0006, done as u32, DP_RDBUFF_READ as u32, result.data);
+                        output += 4;
+                        done += 1;
+                    } else if status == DAP_TRANSFER_OK {
+                        status = DAP_TRANSFER_ERROR;
+                    }
                 }
-                if output + 4 > PACKET_SIZE {
+            } else {
+                let byte_count = transfer_count.saturating_mul(4);
+                if output + byte_count > response.len() {
                     status = DAP_TRANSFER_ERROR;
-                    break;
+                } else {
+                    let result = self.swj.swd_read_block(
+                        dap_request,
+                        &mut response[output..output + byte_count],
+                        transfer_count,
+                        self.wait_retries,
+                    );
+                    done = result.done;
+                    status = transfer_status(result.status);
+                    output += result.done * 4;
                 }
-                response[output..output + 4].copy_from_slice(&result.data.to_le_bytes());
-                trace_event(0x4800_0006, done as u32, request_value as u32, result.data);
-                output += 4;
-                done += 1;
             }
         } else {
+            counter_add(CTR_BLOCK_WRITE_CMDS, 1);
+            counter_add(CTR_BLOCK_WRITE_WORDS_REQUESTED, transfer_count as u32);
+            if dap_request & DAP_TRANSFER_APNDP != 0 {
+                counter_add(CTR_BLOCK_WRITE_AP_CMDS, 1);
+            } else {
+                counter_add(CTR_BLOCK_WRITE_DP_CMDS, 1);
+            }
             let byte_count = transfer_count.saturating_mul(4);
             if let Some(bytes) = request.get(input..input + byte_count) {
                 let result =
@@ -779,7 +886,7 @@ impl<P: ProbeIo> Dap<P> {
                 status = DAP_TRANSFER_ERROR;
             }
 
-            if status == DAP_TRANSFER_OK && CHECK_POSTED_WRITES {
+            if status == DAP_TRANSFER_OK && CHECK_BLOCK_POSTED_WRITES {
                 let result = self.swd_transfer_with_retry(DP_RDBUFF_READ, 0);
                 status = transfer_status(result.status);
                 trace_event(0x4820_0006, done as u32, status as u32, result.data);
@@ -787,12 +894,20 @@ impl<P: ProbeIo> Dap<P> {
         }
 
         let done = done as u16;
+        if is_read {
+            counter_add(CTR_BLOCK_READ_WORDS_DONE, done as u32);
+        } else {
+            counter_add(CTR_BLOCK_WRITE_WORDS_DONE, done as u32);
+        }
+        if status != DAP_TRANSFER_OK {
+            counter_add(CTR_BLOCK_NON_OK, 1);
+        }
         response[1..3].copy_from_slice(&done.to_le_bytes());
         response[3] = status;
         output
     }
 
-    fn write_abort(&mut self, request: &[u8], response: &mut [u8; PACKET_SIZE]) -> usize {
+    fn write_abort(&mut self, request: &[u8], response: &mut [u8]) -> usize {
         if request.len() < 6 {
             response[1] = DAP_TRANSFER_ERROR;
             return 2;
@@ -834,16 +949,21 @@ impl<P: ProbeIo> Dap<P> {
         dap_request: u8,
         write_data: u32,
     ) -> crate::swj::TransferResult {
+        counter_add(CTR_SWD_RETRY_CALLS, 1);
         let mut result = self.swj.swd_transfer(dap_request, write_data);
         let mut retry = self.wait_retries;
         while result.status == TransferStatus::Wait && retry != 0 {
+            counter_add(CTR_SWD_WAIT_RETRIES, 1);
             retry -= 1;
             result = self.swj.swd_transfer(dap_request, write_data);
+        }
+        if result.status != TransferStatus::Ok {
+            counter_add(CTR_SWD_NON_OK, 1);
         }
         result
     }
 
-    fn jtag_transfer(&mut self, request: &[u8], response: &mut [u8; PACKET_SIZE]) -> usize {
+    fn jtag_transfer(&mut self, request: &[u8], response: &mut [u8]) -> usize {
         if !self.select_jtag_index(request[1]) {
             response[1] = 0;
             response[2] = 0;
@@ -882,7 +1002,7 @@ impl<P: ProbeIo> Dap<P> {
                     if status != DAP_TRANSFER_OK {
                         break;
                     }
-                    if output + 4 > PACKET_SIZE {
+                    if output + 4 > response.len() {
                         status = DAP_TRANSFER_ERROR;
                         break;
                     }
@@ -947,7 +1067,7 @@ impl<P: ProbeIo> Dap<P> {
                     if status != DAP_TRANSFER_OK {
                         break;
                     }
-                    if output + 4 > PACKET_SIZE {
+                    if output + 4 > response.len() {
                         status = DAP_TRANSFER_ERROR;
                         break;
                     }
@@ -988,7 +1108,7 @@ impl<P: ProbeIo> Dap<P> {
             let result = self.jtag_transfer_with_ir(&mut current_ir, JTAG_DPACC, DP_RDBUFF_READ, 0);
             status = transfer_status(result.status);
             if status == DAP_TRANSFER_OK && post_read {
-                if output + 4 <= PACKET_SIZE {
+                if output + 4 <= response.len() {
                     response[output..output + 4].copy_from_slice(&result.data.to_le_bytes());
                     output += 4;
                 } else {
@@ -1002,7 +1122,7 @@ impl<P: ProbeIo> Dap<P> {
         output
     }
 
-    fn jtag_transfer_block(&mut self, request: &[u8], response: &mut [u8; PACKET_SIZE]) -> usize {
+    fn jtag_transfer_block(&mut self, request: &[u8], response: &mut [u8]) -> usize {
         if !self.select_jtag_index(request[1]) {
             response[1] = 0;
             response[2] = 0;
@@ -1038,7 +1158,7 @@ impl<P: ProbeIo> Dap<P> {
                 if status != DAP_TRANSFER_OK {
                     break;
                 }
-                if output + 4 > PACKET_SIZE {
+                if output + 4 > response.len() {
                     status = DAP_TRANSFER_ERROR;
                     break;
                 }
@@ -1129,33 +1249,33 @@ impl<P: ProbeIo> Dap<P> {
     }
 }
 
-fn info_str(response: &mut [u8; PACKET_SIZE], value: &str) -> usize {
+fn info_str(response: &mut [u8], value: &str) -> usize {
     let bytes = value.as_bytes();
-    let len = bytes.len().min(PACKET_SIZE - 2);
+    let len = bytes.len().min(response.len().saturating_sub(2));
     response[1] = len as u8;
     response[2..2 + len].copy_from_slice(&bytes[..len]);
     2 + len
 }
 
-fn info_u8(response: &mut [u8; PACKET_SIZE], value: u8) -> usize {
+fn info_u8(response: &mut [u8], value: u8) -> usize {
     response[1] = 1;
     response[2] = value;
     3
 }
 
-fn info_u16(response: &mut [u8; PACKET_SIZE], value: u16) -> usize {
+fn info_u16(response: &mut [u8], value: u16) -> usize {
     response[1] = 2;
     response[2..4].copy_from_slice(&value.to_le_bytes());
     4
 }
 
-fn info_u32(response: &mut [u8; PACKET_SIZE], value: u32) -> usize {
+fn info_u32(response: &mut [u8], value: u32) -> usize {
     response[1] = 4;
     response[2..6].copy_from_slice(&value.to_le_bytes());
     6
 }
 
-fn info_capabilities(response: &mut [u8; PACKET_SIZE]) -> usize {
+fn info_capabilities(response: &mut [u8]) -> usize {
     response[1] = 1;
     response[2] = 0x03;
     3
@@ -1320,5 +1440,19 @@ fn trace_event(tag: u32, a: u32, b: u32, c: u32) {
         core::ptr::write_volatile(base.add((index + 2) & 1023), b);
         core::ptr::write_volatile(base.add((index + 3) & 1023), c);
         core::ptr::write_volatile(&raw mut DAP_TRACE_INDEX, index.wrapping_add(4) as u32);
+    }
+}
+
+#[inline(always)]
+fn counter_add(index: usize, value: u32) {
+    if !ENABLE_DAP_COUNTERS || index >= 64 {
+        return;
+    }
+
+    unsafe {
+        let base = (&raw mut YBLINK_DAP_COUNTERS) as *mut [u32; 64] as *mut u32;
+        let ptr = base.add(index);
+        let current = core::ptr::read_volatile(ptr);
+        core::ptr::write_volatile(ptr, current.wrapping_add(value));
     }
 }

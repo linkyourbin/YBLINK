@@ -9,7 +9,7 @@ use hpm5301_hal::sysctl::{self, Resource};
 use hpm5301_hal::{Peri, pac, peripherals};
 
 pub const DEFAULT_BAUD: u32 = 1_000_000;
-pub const UART_RX_DMA_BUFFER_SIZE: usize = 96 * 1024;
+pub const UART_RX_DMA_BUFFER_SIZE: usize = 64 * 1024;
 pub const SERIAL_USB_PACKET_SIZE: usize = 512;
 
 const UART_CLOCK_HZ: u32 = 400_000_000;

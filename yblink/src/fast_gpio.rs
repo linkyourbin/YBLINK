@@ -1,7 +1,7 @@
 use core::marker::PhantomData;
 use core::ptr;
 
-use crate::swj::{ProbeIo, TransferStatus, WriteBlockResult};
+use crate::swj::{ProbeIo, ReadBlockResult, TransferStatus, WriteBlockResult};
 use hpm5301_hal::{Peri, pac, peripherals};
 
 pub const PIN_TDO: u8 = 26;
@@ -32,6 +32,7 @@ const DEFAULT_SWJ_CLOCK_HZ: u32 = 1_000_000;
 pub struct ProbePins {
     half_period_delay: u8,
     write_half_period_delay: u8,
+    swdio_output_enabled: bool,
     output_a: u32,
     output_b: u32,
     _owned: PhantomData<(
@@ -74,6 +75,7 @@ impl ProbePins {
         Self {
             half_period_delay: swd_delay_for_hz(DEFAULT_SWJ_CLOCK_HZ),
             write_half_period_delay: swd_write_delay_for_hz(DEFAULT_SWJ_CLOCK_HZ),
+            swdio_output_enabled: true,
             output_a,
             output_b,
             _owned: PhantomData,
@@ -87,12 +89,18 @@ impl ProbePins {
 
     #[inline(always)]
     pub fn swdio_output(&mut self) {
-        oe_set(PORT_A, SWDIO_TMS);
+        if !self.swdio_output_enabled {
+            oe_set(PORT_A, SWDIO_TMS);
+            self.swdio_output_enabled = true;
+        }
     }
 
     #[inline(always)]
     pub fn swdio_input(&mut self) {
-        oe_clear(PORT_A, SWDIO_TMS);
+        if self.swdio_output_enabled {
+            oe_clear(PORT_A, SWDIO_TMS);
+            self.swdio_output_enabled = false;
+        }
     }
 
     #[inline(always)]
@@ -112,12 +120,15 @@ impl ProbePins {
 
     #[inline(always)]
     pub fn set_reset(&mut self, high: bool) {
-        if high {
-            self.output_b |= NRESET;
+        let output_b = if high {
+            self.output_b | NRESET
         } else {
-            self.output_b &= !NRESET;
+            self.output_b & !NRESET
+        };
+        if output_b != self.output_b {
+            self.output_b = output_b;
+            write_do(PORT_B, self.output_b);
         }
-        write_do(PORT_B, self.output_b);
     }
 
     #[inline(always)]
@@ -346,6 +357,52 @@ impl ProbePins {
     }
 
     #[inline(always)]
+    pub fn swd_read_block_fast(
+        &mut self,
+        swd_request: u8,
+        out: &mut [u8],
+        count: usize,
+        wait_retries: usize,
+    ) -> ReadBlockResult {
+        self.swdio_output();
+
+        let mut done = 0;
+        let mut output = 0;
+        while done < count {
+            if output + 4 > out.len() {
+                return ReadBlockResult {
+                    status: TransferStatus::ProtocolError,
+                    done,
+                };
+            }
+
+            let mut retry = wait_retries;
+            loop {
+                let result = self.swd_read_transfer_fast(swd_request);
+                if result.status != TransferStatus::Wait || retry == 0 {
+                    if result.status != TransferStatus::Ok {
+                        return ReadBlockResult {
+                            status: result.status,
+                            done,
+                        };
+                    }
+                    out[output..output + 4].copy_from_slice(&result.data.to_le_bytes());
+                    break;
+                }
+                retry -= 1;
+            }
+
+            output += 4;
+            done += 1;
+        }
+
+        ReadBlockResult {
+            status: TransferStatus::Ok,
+            done,
+        }
+    }
+
+    #[inline(always)]
     pub fn swd_write_transfer_fast(&mut self, swd_request: u8, write_data: u32) -> TransferStatus {
         self.swdio_output();
         let ack = self.swd_write_request_read_ack(swd_request);
@@ -528,12 +585,15 @@ impl ProbePins {
 
     #[inline(always)]
     fn write_a_level(&mut self, mask: u32, high: bool) {
-        if high {
-            self.output_a |= mask;
+        let output_a = if high {
+            self.output_a | mask
         } else {
-            self.output_a &= !mask;
+            self.output_a & !mask
+        };
+        if output_a != self.output_a {
+            self.output_a = output_a;
+            write_do(PORT_A, self.output_a);
         }
-        write_do(PORT_A, self.output_a);
     }
 
     #[inline(always)]
@@ -659,6 +719,30 @@ impl ProbeIo for ProbePins {
     }
 
     #[inline(always)]
+    fn swd_read_block(
+        &mut self,
+        request: u8,
+        out: &mut [u8],
+        count: usize,
+        wait_retries: usize,
+        turnaround: u8,
+        idle_cycles: u8,
+        data_phase_on_wait_fault: bool,
+    ) -> Option<ReadBlockResult> {
+        if turnaround == 1 && idle_cycles == 0 && !data_phase_on_wait_fault {
+            Some(ProbePins::swd_read_block_fast(
+                self,
+                make_swd_request(request),
+                out,
+                count,
+                wait_retries,
+            ))
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
     fn swd_transfer(
         &mut self,
         request: u8,
@@ -708,6 +792,12 @@ impl ProbeIo for ProbePins {
                 status: ProbePins::swd_write_transfer_fast(self, swd_request, write_data),
                 data: 0,
             })
+        } else if swd_request & 0x04 != 0
+            && turnaround == 1
+            && idle_cycles == 0
+            && !data_phase_on_wait_fault
+        {
+            Some(ProbePins::swd_read_transfer_fast(self, swd_request))
         } else {
             None
         }
@@ -752,8 +842,8 @@ fn swd_delay_for_hz(hz: u32) -> u8 {
         2_000_001..=3_000_000 => 7,
         3_000_001..=4_000_000 => 5,
         4_000_001..=8_000_000 => 3,
-        8_000_001..=20_000_000 => 2,
-        _ => 1,
+        8_000_001..=20_000_000 => 1,
+        _ => 0,
     }
 }
 

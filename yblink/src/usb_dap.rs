@@ -73,6 +73,40 @@ impl<'d, D: Driver<'d>> CmsisDapV2Class<'d, D> {
         }
     }
 
+    pub fn split(self) -> (CmsisDapV2Reader<'d, D>, CmsisDapV2Writer<'d, D>) {
+        (
+            CmsisDapV2Reader {
+                read_ep: self.read_ep,
+            },
+            CmsisDapV2Writer {
+                write_ep: self.write_ep,
+                trace_ep: self.trace_ep,
+                max_packet_size: self.max_packet_size,
+            },
+        )
+    }
+
+    #[allow(dead_code)]
+    pub async fn write_trace(&mut self, data: &[u8]) -> Result<(), EndpointError> {
+        let Some(ep) = self.trace_ep.as_mut() else {
+            return Err(EndpointError::Disabled);
+        };
+
+        ep.write(data).await?;
+        if data.len() > self.max_packet_size as usize
+            && data.len() % self.max_packet_size as usize == 0
+        {
+            ep.write(&[]).await?;
+        }
+        Ok(())
+    }
+}
+
+pub struct CmsisDapV2Reader<'d, D: Driver<'d>> {
+    read_ep: D::EndpointOut,
+}
+
+impl<'d, D: Driver<'d>> CmsisDapV2Reader<'d, D> {
     pub async fn wait_connection(&mut self) {
         self.read_ep.wait_enabled().await;
     }
@@ -80,7 +114,16 @@ impl<'d, D: Driver<'d>> CmsisDapV2Class<'d, D> {
     pub async fn read_packet(&mut self, data: &mut [u8]) -> Result<usize, EndpointError> {
         self.read_ep.read(data).await
     }
+}
 
+pub struct CmsisDapV2Writer<'d, D: Driver<'d>> {
+    write_ep: D::EndpointIn,
+    #[allow(dead_code)]
+    trace_ep: Option<D::EndpointIn>,
+    max_packet_size: u16,
+}
+
+impl<'d, D: Driver<'d>> CmsisDapV2Writer<'d, D> {
     pub async fn write_packet(&mut self, data: &[u8]) -> Result<(), EndpointError> {
         self.write_ep.write(data).await?;
         if data.len() > self.max_packet_size as usize

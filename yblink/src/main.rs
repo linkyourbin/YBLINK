@@ -9,8 +9,11 @@ mod swj;
 mod usb_dap;
 
 use core::cell::UnsafeCell;
+use core::future::{Future, poll_fn};
+use core::pin::Pin;
+use core::task::Poll;
 
-use dap::{DAP_PRODUCT, DAP_SERIAL, DAP_VENDOR, Dap, PACKET_SIZE};
+use dap::{DAP_PRODUCT, DAP_SERIAL, DAP_VENDOR, Dap, PACKET_COUNT, PACKET_SIZE};
 use embassy_executor::Spawner;
 use embassy_futures::join::join3;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcAcmState};
@@ -40,9 +43,11 @@ static CONTROL_BUF: StaticCell<[u8; 256]> = StaticCell::new([0; 256]);
 static CMSIS_DAP_STATE: StaticCell<CmsisDapState> = StaticCell::new(CmsisDapState::new());
 static CDC_ACM_STATE: StaticCell<CdcAcmState<'static>> = StaticCell::new(CdcAcmState::new());
 #[unsafe(link_section = ".noncacheable")]
-static REQUEST_BUF: StaticCell<[u8; PACKET_SIZE]> = StaticCell::new([0; PACKET_SIZE]);
+static REQUEST_BUF: StaticCell<PacketBuffers<PACKET_SIZE, PACKET_COUNT>> =
+    StaticCell::new(PacketBuffers::new());
 #[unsafe(link_section = ".noncacheable")]
-static RESPONSE_BUF: StaticCell<[u8; PACKET_SIZE]> = StaticCell::new([0; PACKET_SIZE]);
+static RESPONSE_BUF: StaticCell<PacketBuffers<PACKET_SIZE, PACKET_COUNT>> =
+    StaticCell::new(PacketBuffers::new());
 #[unsafe(link_section = ".noncacheable")]
 static SERIAL_USB_OUT_BUF: StaticCell<[u8; SERIAL_USB_PACKET_SIZE]> =
     StaticCell::new([0; SERIAL_USB_PACKET_SIZE]);
@@ -88,7 +93,7 @@ async fn main(_spawner: Spawner) {
     builder.msos_feature(msos::CcgpDeviceDescriptor::new());
     boot_mark(0x5301_0036);
 
-    let mut cmsis_dap = CmsisDapV2Class::new(&mut builder, CMSIS_DAP_STATE.get(), 512, true);
+    let cmsis_dap = CmsisDapV2Class::new(&mut builder, CMSIS_DAP_STATE.get(), 512, true);
     let cdc_acm = CdcAcmClass::new(
         &mut builder,
         CDC_ACM_STATE.get(),
@@ -110,38 +115,65 @@ async fn main(_spawner: Spawner) {
     );
     let (uart_tx, uart_rx) = serial.split();
 
-    let request = REQUEST_BUF.get();
-    let response = RESPONSE_BUF.get();
+    let requests = REQUEST_BUF.get().as_mut();
+    let responses = RESPONSE_BUF.get().as_mut();
 
     let usb_fut = usb.run();
     let dap_fut = async move {
-        cmsis_dap.wait_connection().await;
+        let (mut dap_reader, mut dap_writer) = cmsis_dap.split();
+        dap_reader.wait_connection().await;
 
         let pins = ProbePins::new(p.PA26, p.PA27, p.PA28, p.PA29, p.PB10);
         let mut dap = Dap::new(Swj::new(pins));
 
         loop {
-            loop {
-                let len = match cmsis_dap.read_packet(request).await {
-                    Ok(len) => len,
-                    Err(_) => break,
-                };
-
-                let response_len = dap.process(&request[..len], response);
-                if response_len == 0 {
+            let mut current = 0usize;
+            let mut len = match dap_reader.read_packet(&mut requests[current]).await {
+                Ok(len) => len,
+                Err(_) => {
+                    dap_reader.wait_connection().await;
                     continue;
                 }
+            };
 
-                if cmsis_dap
-                    .write_packet(&response[..response_len])
+            loop {
+                let next = (current + 1) % PACKET_COUNT;
+                let (request, next_request) = packet_pair(requests, current, next);
+                let mut next_read = dap_reader.read_packet(next_request);
+                let next_read = unsafe { Pin::new_unchecked(&mut next_read) };
+                let mut next_read = next_read;
+                let _ = poll_once(next_read.as_mut()).await;
+
+                let response_len = dap.process(&request[..len], &mut responses[current]);
+                if response_len == 0 {
+                    match next_read.await {
+                        Ok(next_len) => {
+                            current = next;
+                            len = next_len;
+                            continue;
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                if dap_writer
+                    .write_packet(&responses[current][..response_len])
                     .await
                     .is_err()
                 {
                     break;
                 }
+
+                match next_read.await {
+                    Ok(next_len) => {
+                        current = next;
+                        len = next_len;
+                    }
+                    Err(_) => break,
+                }
             }
 
-            cmsis_dap.wait_connection().await;
+            dap_reader.wait_connection().await;
         }
     };
     let serial_fut = serial::run(
@@ -154,6 +186,32 @@ async fn main(_spawner: Spawner) {
     );
 
     let _ = join3(usb_fut, dap_fut, serial_fut).await;
+}
+
+async fn poll_once<F: Future>(mut future: Pin<&mut F>) -> Option<F::Output> {
+    poll_fn(|cx| match future.as_mut().poll(cx) {
+        Poll::Ready(value) => Poll::Ready(Some(value)),
+        Poll::Pending => Poll::Ready(None),
+    })
+    .await
+}
+
+fn packet_pair<const N: usize>(
+    packets: &mut [[u8; PACKET_SIZE]; N],
+    current: usize,
+    next: usize,
+) -> (&[u8; PACKET_SIZE], &mut [u8; PACKET_SIZE]) {
+    debug_assert!(current < N);
+    debug_assert!(next < N);
+    debug_assert!(current != next);
+
+    if current < next {
+        let (left, right) = packets.split_at_mut(next);
+        (&left[current], &mut right[0])
+    } else {
+        let (left, right) = packets.split_at_mut(current);
+        (&right[0], &mut left[next])
+    }
 }
 
 #[inline(always)]
@@ -170,6 +228,19 @@ impl<T> StaticCell<T> {
 
     fn get(&'static self) -> &'static mut T {
         unsafe { &mut *self.0.get() }
+    }
+}
+
+#[repr(align(4096))]
+struct PacketBuffers<const SIZE: usize, const COUNT: usize>([[u8; SIZE]; COUNT]);
+
+impl<const SIZE: usize, const COUNT: usize> PacketBuffers<SIZE, COUNT> {
+    const fn new() -> Self {
+        Self([[0; SIZE]; COUNT])
+    }
+
+    fn as_mut(&mut self) -> &mut [[u8; SIZE]; COUNT] {
+        &mut self.0
     }
 }
 

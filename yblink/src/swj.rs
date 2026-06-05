@@ -113,6 +113,29 @@ pub trait ProbeIo {
         );
         None
     }
+
+    #[inline(always)]
+    fn swd_read_block(
+        &mut self,
+        request: u8,
+        out: &mut [u8],
+        count: usize,
+        wait_retries: usize,
+        turnaround: u8,
+        idle_cycles: u8,
+        data_phase_on_wait_fault: bool,
+    ) -> Option<ReadBlockResult> {
+        let _ = (
+            request,
+            out,
+            count,
+            wait_retries,
+            turnaround,
+            idle_cycles,
+            data_phase_on_wait_fault,
+        );
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,6 +162,11 @@ pub struct TransferResult {
 }
 
 pub struct WriteBlockResult {
+    pub status: TransferStatus,
+    pub done: usize,
+}
+
+pub struct ReadBlockResult {
     pub status: TransferStatus,
     pub done: usize,
 }
@@ -743,6 +771,64 @@ impl<P: ProbeIo> Swj<P> {
         }
 
         WriteBlockResult {
+            status: TransferStatus::Ok,
+            done,
+        }
+    }
+
+    #[inline(never)]
+    #[unsafe(link_section = ".fast")]
+    pub fn swd_read_block(
+        &mut self,
+        request: u8,
+        out: &mut [u8],
+        count: usize,
+        wait_retries: usize,
+    ) -> ReadBlockResult {
+        if let Some(result) = self.pins.swd_read_block(
+            request,
+            out,
+            count,
+            wait_retries,
+            self.turnaround_cycles,
+            self.idle_cycles,
+            self.data_phase_on_wait_fault,
+        ) {
+            return result;
+        }
+
+        let mut done = 0;
+        let mut output = 0;
+
+        while done < count {
+            if output + 4 > out.len() {
+                return ReadBlockResult {
+                    status: TransferStatus::ProtocolError,
+                    done,
+                };
+            }
+
+            let mut retry = wait_retries;
+            loop {
+                let result = self.swd_transfer(request, 0);
+                if result.status != TransferStatus::Wait || retry == 0 {
+                    if result.status != TransferStatus::Ok {
+                        return ReadBlockResult {
+                            status: result.status,
+                            done,
+                        };
+                    }
+                    out[output..output + 4].copy_from_slice(&result.data.to_le_bytes());
+                    break;
+                }
+                retry -= 1;
+            }
+
+            output += 4;
+            done += 1;
+        }
+
+        ReadBlockResult {
             status: TransferStatus::Ok,
             done,
         }
