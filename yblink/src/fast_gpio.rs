@@ -198,6 +198,7 @@ impl ProbePins {
     }
 
     #[inline(always)]
+    #[unsafe(link_section = ".fast")]
     pub fn swd_write_data_bits(&mut self, mut bits: u32, count: usize) {
         let delay = self.write_half_period_delay;
         if delay == 0 {
@@ -242,6 +243,7 @@ impl ProbePins {
     }
 
     #[inline(always)]
+    #[unsafe(link_section = ".fast")]
     pub fn swclk_sample_swdio_bits(&mut self, count: usize) -> u32 {
         let delay = self.half_period_delay;
         let mut value = 0;
@@ -261,6 +263,7 @@ impl ProbePins {
     }
 
     #[inline(always)]
+    #[unsafe(link_section = ".fast")]
     pub fn swclk_sample_swdio_3bits(&mut self) -> u8 {
         let delay = self.half_period_delay;
         let mut value = 0;
@@ -294,6 +297,7 @@ impl ProbePins {
     }
 
     #[inline(always)]
+    #[unsafe(link_section = ".fast")]
     pub fn swd_write_block_fast(
         &mut self,
         swd_request: u8,
@@ -375,6 +379,7 @@ impl ProbePins {
     }
 
     #[inline(always)]
+    #[unsafe(link_section = ".fast")]
     pub fn swd_read_block_fast(
         &mut self,
         swd_request: u8,
@@ -421,6 +426,7 @@ impl ProbePins {
     }
 
     #[inline(always)]
+    #[unsafe(link_section = ".fast")]
     pub fn swd_write_transfer_fast(&mut self, swd_request: u8, write_data: u32) -> TransferStatus {
         self.swdio_output();
         let ack = self.swd_write_request_read_ack(swd_request);
@@ -457,6 +463,7 @@ impl ProbePins {
     }
 
     #[inline(always)]
+    #[unsafe(link_section = ".fast")]
     pub fn swd_read_transfer_fast(&mut self, swd_request: u8) -> crate::swj::TransferResult {
         self.swdio_output();
         let ack = self.swd_write_request_read_ack(swd_request);
@@ -515,6 +522,7 @@ impl ProbePins {
     }
 
     #[inline(always)]
+    #[unsafe(link_section = ".fast")]
     fn swd_write_request_read_ack(&mut self, swd_request: u8) -> u8 {
         self.swd_write_data_bits(swd_request as u32, 8);
         self.swdio_input();
@@ -523,6 +531,7 @@ impl ProbePins {
     }
 
     #[inline(always)]
+    #[unsafe(link_section = ".fast")]
     fn finish_protocol_error_fast(&mut self) {
         self.swdio_input();
         let _ = self.swclk_sample_swdio_bits(34);

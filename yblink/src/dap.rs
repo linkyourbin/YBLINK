@@ -65,6 +65,14 @@ const DAP_TRANSFER_RNW: u8 = 1 << 1;
 const DAP_TRANSFER_MATCH_VALUE: u8 = 1 << 4;
 const DAP_TRANSFER_MATCH_MASK: u8 = 1 << 5;
 const DP_RDBUFF_READ: u8 = 0x0e;
+const DP_SELECT_WRITE: u8 = 0x08;
+const AP_TAR_WRITE: u8 = 0x05;
+const AP_DRW_WRITE: u8 = 0x0d;
+const AP_DRW_READ: u8 = 0x0f;
+const DHCSR_ADDR: u32 = 0xe000_edf0;
+const DHCSR_C_HALT: u32 = 1 << 1;
+const DHCSR_S_HALT: u32 = 1 << 17;
+const DHCSR_LOCAL_POLL_US: u64 = 50_000;
 const CHECK_POSTED_WRITES: bool = false;
 const CHECK_BLOCK_POSTED_WRITES: bool = false;
 const JTAG_DEV_MAX: usize = 8;
@@ -113,6 +121,8 @@ pub struct Dap<P: ProbeIo> {
     wait_retries: usize,
     match_retries: usize,
     match_mask: u32,
+    target_ap_tar: Option<u32>,
+    dhcsr_run_pending: bool,
 }
 
 impl<P: ProbeIo> Dap<P> {
@@ -128,6 +138,8 @@ impl<P: ProbeIo> Dap<P> {
             wait_retries: 100,
             match_retries: 0,
             match_mask: 0,
+            target_ap_tar: None,
+            dhcsr_run_pending: false,
         }
     }
 
@@ -153,6 +165,7 @@ impl<P: ProbeIo> Dap<P> {
             ID_DAP_CONNECT => self.connect(request, response),
             ID_DAP_DISCONNECT => {
                 self.port = Port::Disabled;
+                self.invalidate_target_state();
                 response[1] = DAP_OK;
                 2
             }
@@ -161,6 +174,7 @@ impl<P: ProbeIo> Dap<P> {
                     self.swj.set_idle_cycles(request[1]);
                     self.wait_retries = u16::from_le_bytes([request[2], request[3]]) as usize;
                     self.match_retries = u16::from_le_bytes([request[4], request[5]]) as usize;
+                    self.invalidate_target_state();
                     response[1] = DAP_OK;
                 } else {
                     response[1] = DAP_ERROR;
@@ -184,6 +198,7 @@ impl<P: ProbeIo> Dap<P> {
                 if let Some(&config) = request.get(1) {
                     self.swj
                         .configure_swd((config & 0b011) + 1, config & 0b100 != 0);
+                    self.invalidate_target_state();
                     response[1] = DAP_OK;
                 } else {
                     response[1] = DAP_ERROR;
@@ -224,6 +239,7 @@ impl<P: ProbeIo> Dap<P> {
             ID_DAP_TRANSFER_BLOCK => self.transfer_block(request, response),
             ID_DAP_WRITE_ABORT => self.write_abort(request, response),
             ID_DAP_TRANSFER_ABORT => {
+                self.invalidate_target_state();
                 response[1] = DAP_OK;
                 2
             }
@@ -239,6 +255,7 @@ impl<P: ProbeIo> Dap<P> {
             }
             ID_DAP_RESET_TARGET => {
                 self.swj.reset_target();
+                self.invalidate_target_state();
                 response[1] = DAP_OK;
                 response[2] = 1;
                 3
@@ -286,8 +303,15 @@ impl<P: ProbeIo> Dap<P> {
             _ => Port::Disabled,
         };
         self.swj.connect(self.port);
+        self.invalidate_target_state();
         response[1] = self.port as u8;
         2
+    }
+
+    #[inline(always)]
+    fn invalidate_target_state(&mut self) {
+        self.target_ap_tar = None;
+        self.dhcsr_run_pending = false;
     }
 
     fn swj_pins(&mut self, request: &[u8], response: &mut [u8]) -> usize {
@@ -297,6 +321,9 @@ impl<P: ProbeIo> Dap<P> {
         }
         let values = request[1];
         let select = request[2] & !0x20;
+        if select & 0x80 != 0 {
+            self.invalidate_target_state();
+        }
         let wait_us = u32::from_le_bytes([request[3], request[4], request[5], request[6]]);
         let mut state = self.swj.set_pins(values, select);
 
@@ -382,6 +409,7 @@ impl<P: ProbeIo> Dap<P> {
         }
         self.swj
             .swj_sequence(bit_count, &request[2..2 + byte_count]);
+        self.invalidate_target_state();
         response[1] = DAP_OK;
         2
     }
@@ -420,6 +448,7 @@ impl<P: ProbeIo> Dap<P> {
                 self.swj
                     .swd_read_sequence(bit_count, &mut response[output..output + byte_count]);
                 output += byte_count;
+                self.invalidate_target_state();
             } else {
                 let Some(data) = request.get(input..input + byte_count) else {
                     response[1] = DAP_ERROR;
@@ -427,6 +456,7 @@ impl<P: ProbeIo> Dap<P> {
                 };
                 self.swj.swd_write_sequence(bit_count, data);
                 input += byte_count;
+                self.invalidate_target_state();
             }
         }
 
@@ -611,6 +641,7 @@ impl<P: ProbeIo> Dap<P> {
                     if status != DAP_TRANSFER_OK {
                         break;
                     }
+                    self.note_successful_read(dap_request);
                     if output + 4 > response.len() {
                         status = DAP_TRANSFER_ERROR;
                         break;
@@ -635,6 +666,7 @@ impl<P: ProbeIo> Dap<P> {
                         if status != DAP_TRANSFER_OK {
                             break;
                         }
+                        self.note_successful_read(dap_request);
                     }
 
                     let mut match_retry = self.match_retries;
@@ -645,6 +677,7 @@ impl<P: ProbeIo> Dap<P> {
                         if status != DAP_TRANSFER_OK {
                             break;
                         }
+                        self.note_successful_read(dap_request);
                         if (result.data & self.match_mask) == target {
                             break;
                         }
@@ -665,6 +698,7 @@ impl<P: ProbeIo> Dap<P> {
                         if status != DAP_TRANSFER_OK {
                             break;
                         }
+                        self.note_successful_read(dap_request);
                         post_read = true;
                     }
                 } else {
@@ -673,6 +707,7 @@ impl<P: ProbeIo> Dap<P> {
                     if status != DAP_TRANSFER_OK {
                         break;
                     }
+                    self.note_successful_read(dap_request);
                     if output + 4 > response.len() {
                         status = DAP_TRANSFER_ERROR;
                         break;
@@ -719,11 +754,22 @@ impl<P: ProbeIo> Dap<P> {
                     if status != DAP_TRANSFER_OK {
                         break;
                     }
+                    self.note_successful_write(dap_request, write_data);
                     check_write = true;
                 };
             }
 
             done = done.wrapping_add(1);
+        }
+
+        if status == DAP_TRANSFER_OK
+            && done as usize == transfer_count
+            && response.len() >= 7
+            && self.try_local_dhcsr_poll(request, transfer_count, response)
+        {
+            response[1] = done;
+            response[2] = DAP_TRANSFER_OK;
+            return 7;
         }
 
         if status == DAP_TRANSFER_OK {
@@ -751,6 +797,116 @@ impl<P: ProbeIo> Dap<P> {
             counter_add(CTR_TRANSFER_NON_OK, 1);
         }
         output
+    }
+
+    fn try_local_dhcsr_poll(
+        &mut self,
+        request: &[u8],
+        transfer_count: usize,
+        response: &mut [u8],
+    ) -> bool {
+        if !self.dhcsr_run_pending || !is_dhcsr_read_transfer(request, transfer_count) {
+            return false;
+        }
+
+        let start = time::now_ticks();
+        let timeout = time::ticks_from_micros(DHCSR_LOCAL_POLL_US);
+        let result = self.swd_transfer_with_retry(DP_RDBUFF_READ, 0);
+        if result.status != TransferStatus::Ok {
+            return false;
+        }
+        let mut data = result.data;
+        self.target_ap_tar = None;
+
+        loop {
+            if data & DHCSR_S_HALT != 0 {
+                self.dhcsr_run_pending = false;
+                break;
+            }
+
+            if time::now_ticks().wrapping_sub(start) >= timeout {
+                break;
+            }
+
+            let result = self.swd_transfer_with_retry(AP_TAR_WRITE, DHCSR_ADDR);
+            if result.status != TransferStatus::Ok {
+                break;
+            }
+
+            let result = self.swd_transfer_with_retry(AP_DRW_READ, 0);
+            if result.status != TransferStatus::Ok {
+                break;
+            }
+
+            let result = self.swd_transfer_with_retry(DP_RDBUFF_READ, 0);
+            if result.status != TransferStatus::Ok {
+                break;
+            }
+
+            data = result.data;
+        }
+
+        response[3..7].copy_from_slice(&data.to_le_bytes());
+        true
+    }
+
+    #[inline(always)]
+    fn note_successful_write(&mut self, dap_request: u8, write_data: u32) {
+        match dap_request {
+            AP_TAR_WRITE => {
+                self.target_ap_tar = Some(write_data);
+            }
+            AP_DRW_WRITE => {
+                if self.target_ap_tar == Some(DHCSR_ADDR) {
+                    self.dhcsr_run_pending = write_data & DHCSR_C_HALT == 0;
+                }
+                self.target_ap_tar = None;
+            }
+            DP_SELECT_WRITE => {
+                self.target_ap_tar = None;
+            }
+            _ => {}
+        }
+    }
+
+    #[inline(always)]
+    fn note_successful_read(&mut self, dap_request: u8) {
+        if dap_request == AP_DRW_READ {
+            self.target_ap_tar = None;
+        }
+    }
+
+    #[inline(always)]
+    fn note_successful_block(&mut self, dap_request: u8, data: &[u8], done: usize) {
+        match dap_request {
+            AP_TAR_WRITE => {
+                let input = done.saturating_sub(1).saturating_mul(4);
+                if input + 4 <= data.len() {
+                    self.target_ap_tar = Some(u32::from_le_bytes([
+                        data[input],
+                        data[input + 1],
+                        data[input + 2],
+                        data[input + 3],
+                    ]));
+                } else {
+                    self.target_ap_tar = None;
+                }
+            }
+            AP_DRW_WRITE => {
+                if self.target_ap_tar == Some(DHCSR_ADDR) && data.len() >= 4 {
+                    let write_data = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                    self.dhcsr_run_pending = write_data & DHCSR_C_HALT == 0;
+                }
+                self.target_ap_tar = None;
+            }
+            AP_DRW_READ => {
+                self.target_ap_tar = None;
+            }
+            DP_SELECT_WRITE => {
+                self.target_ap_tar = None;
+            }
+            _ => {}
+        }
     }
 
     #[inline(never)]
@@ -891,6 +1047,10 @@ impl<P: ProbeIo> Dap<P> {
                 status = transfer_status(result.status);
                 trace_event(0x4820_0006, done as u32, status as u32, result.data);
             }
+        }
+
+        if status == DAP_TRANSFER_OK && done != 0 {
+            self.note_successful_block(dap_request, request.get(input..).unwrap_or(&[]), done);
         }
 
         let done = done as u16;
@@ -1297,6 +1457,22 @@ fn transfer_status(status: TransferStatus) -> u8 {
         TransferStatus::NoAck => DAP_TRANSFER_NO_ACK,
         TransferStatus::ProtocolError | TransferStatus::ParityError => DAP_TRANSFER_ERROR,
     }
+}
+
+#[inline(always)]
+fn is_dhcsr_read_transfer(request: &[u8], transfer_count: usize) -> bool {
+    if transfer_count != 2
+        || request.get(3).copied() != Some(AP_TAR_WRITE)
+        || request.get(8).copied() != Some(AP_DRW_READ)
+    {
+        return false;
+    }
+
+    let Some(bytes) = request.get(4..8) else {
+        return false;
+    };
+
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) == DHCSR_ADDR
 }
 
 fn command_request_len(request: &[u8]) -> Option<usize> {
