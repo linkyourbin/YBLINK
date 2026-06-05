@@ -200,6 +200,24 @@ impl ProbePins {
     #[inline(always)]
     pub fn swd_write_data_bits(&mut self, mut bits: u32, count: usize) {
         let delay = self.write_half_period_delay;
+        if delay == 0 {
+            let mut output = self.output_a;
+
+            for _ in 0..count {
+                if bits & 1 != 0 {
+                    output = (output | SWDIO_TMS) & !SWCLK_TCK;
+                } else {
+                    output &= !(SWDIO_TMS | SWCLK_TCK);
+                }
+                write_do(PORT_A, output);
+                output |= SWCLK_TCK;
+                do_set(PORT_A, SWCLK_TCK);
+                bits >>= 1;
+            }
+
+            self.output_a = output;
+            return;
+        }
         if delay != 1 {
             self.swd_write_bits(bits, count);
             return;
@@ -301,7 +319,7 @@ impl ProbePins {
                 let ack = self.swd_write_request_read_ack(swd_request);
                 match ack {
                     0b001 => {
-                        self.swclk_cycle();
+                        self.swclk_turnaround_cycle();
                         self.swdio_output();
                         self.swd_write_data_bits(write_data, 32);
                         self.swd_write_data_bits(parity, 1);
@@ -309,7 +327,7 @@ impl ProbePins {
                         break;
                     }
                     0b010 => {
-                        self.swclk_cycle();
+                        self.swclk_turnaround_cycle();
                         self.swdio_output();
                         self.set_swdio_tms(true);
                         if retry == 0 {
@@ -321,7 +339,7 @@ impl ProbePins {
                         retry -= 1;
                     }
                     0b100 => {
-                        self.swclk_cycle();
+                        self.swclk_turnaround_cycle();
                         self.swdio_output();
                         self.set_swdio_tms(true);
                         return WriteBlockResult {
@@ -408,7 +426,7 @@ impl ProbePins {
         let ack = self.swd_write_request_read_ack(swd_request);
         match ack {
             0b001 => {
-                self.swclk_cycle();
+                self.swclk_turnaround_cycle();
                 self.swdio_output();
                 self.swd_write_data_bits(write_data, 32);
                 self.swd_write_data_bits(odd_parity(write_data) as u32, 1);
@@ -416,13 +434,13 @@ impl ProbePins {
                 TransferStatus::Ok
             }
             0b010 => {
-                self.swclk_cycle();
+                self.swclk_turnaround_cycle();
                 self.swdio_output();
                 self.set_swdio_tms(true);
                 TransferStatus::Wait
             }
             0b100 => {
-                self.swclk_cycle();
+                self.swclk_turnaround_cycle();
                 self.swdio_output();
                 self.set_swdio_tms(true);
                 TransferStatus::Fault
@@ -446,7 +464,7 @@ impl ProbePins {
             0b001 => {
                 let data = self.swclk_sample_swdio_bits(32);
                 let parity = self.swclk_sample_swdio();
-                self.swclk_cycle();
+                self.swclk_turnaround_cycle();
                 self.swdio_output();
                 self.set_swdio_tms(true);
                 if parity == odd_parity(data) {
@@ -462,7 +480,7 @@ impl ProbePins {
                 }
             }
             0b010 => {
-                self.swclk_cycle();
+                self.swclk_turnaround_cycle();
                 self.swdio_output();
                 self.set_swdio_tms(true);
                 crate::swj::TransferResult {
@@ -471,7 +489,7 @@ impl ProbePins {
                 }
             }
             0b100 => {
-                self.swclk_cycle();
+                self.swclk_turnaround_cycle();
                 self.swdio_output();
                 self.set_swdio_tms(true);
                 crate::swj::TransferResult {
@@ -500,7 +518,7 @@ impl ProbePins {
     fn swd_write_request_read_ack(&mut self, swd_request: u8) -> u8 {
         self.swd_write_data_bits(swd_request as u32, 8);
         self.swdio_input();
-        self.swclk_cycle();
+        self.swclk_turnaround_cycle();
         self.swclk_sample_swdio_3bits()
     }
 
@@ -599,6 +617,16 @@ impl ProbePins {
     #[inline(always)]
     fn delay_half(&self) {
         delay_half_count(self.half_period_delay);
+    }
+
+    #[inline(always)]
+    fn swclk_turnaround_cycle(&mut self) {
+        let delay = self.write_half_period_delay;
+        do_clear(PORT_A, SWCLK_TCK);
+        delay_half_count(delay);
+        self.output_a |= SWCLK_TCK;
+        do_set(PORT_A, SWCLK_TCK);
+        delay_half_count(delay);
     }
 }
 
