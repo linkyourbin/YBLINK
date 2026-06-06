@@ -2,13 +2,14 @@ use core::marker::PhantomData;
 use core::ptr;
 
 use crate::swj::{ProbeIo, ReadBlockResult, TransferStatus, WriteBlockResult};
-use hpm5301_hal::{Peri, pac, peripherals};
+use hpm5301_hal::{Peri, pac, peripherals, time};
 
 pub const PIN_TDO: u8 = 26;
 pub const PIN_SWCLK_TCK: u8 = 27;
 pub const PIN_SWDIO_TMS: u8 = 28;
 pub const PIN_TDI: u8 = 29;
 pub const PIN_NRESET: u8 = 10;
+pub const PIN_ACTIVITY_LED: u8 = 10;
 
 const PORT_A: usize = 0;
 const PORT_B: usize = 1;
@@ -24,10 +25,15 @@ const SWDIO_TMS: u32 = 1 << PIN_SWDIO_TMS;
 const TDI: u32 = 1 << PIN_TDI;
 const TDO: u32 = 1 << PIN_TDO;
 const NRESET: u32 = 1 << PIN_NRESET;
+const ACTIVITY_LED: u32 = 1 << PIN_ACTIVITY_LED;
 
-const OUTPUT_MASK_A: u32 = SWCLK_TCK | SWDIO_TMS | TDI;
+const OUTPUT_MASK_A: u32 = SWCLK_TCK | SWDIO_TMS | TDI | ACTIVITY_LED;
 const OUTPUT_MASK_B: u32 = NRESET;
 const DEFAULT_SWJ_CLOCK_HZ: u32 = 1_000_000;
+const ACTIVITY_LED_ACTIVE_HIGH: bool = false;
+const ACTIVITY_LED_MODE: ActivityLedMode = ActivityLedMode::BlinkBusy;
+const ACTIVITY_LED_BLINK_TOGGLE_MS: u64 = 100;
+const ACTIVITY_LED_POLL_INTERVAL: u8 = 64;
 
 pub struct ProbePins {
     half_period_delay: u8,
@@ -35,13 +41,25 @@ pub struct ProbePins {
     swdio_output_enabled: bool,
     output_a: u32,
     output_b: u32,
+    activity_led_active: bool,
+    activity_led_lit: bool,
+    activity_led_next_toggle: u64,
+    activity_led_poll_count: u8,
     _owned: PhantomData<(
         peripherals::PA26,
         peripherals::PA27,
         peripherals::PA28,
         peripherals::PA29,
         peripherals::PB10,
+        peripherals::PA10,
     )>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+enum ActivityLedMode {
+    SteadyBusy,
+    BlinkBusy,
 }
 
 impl ProbePins {
@@ -51,20 +69,23 @@ impl ProbePins {
         _swdio_tms: Peri<'static, peripherals::PA28>,
         _tdi: Peri<'static, peripherals::PA29>,
         _nreset: Peri<'static, peripherals::PB10>,
+        _activity_led: Peri<'static, peripherals::PA10>,
     ) -> Self {
         configure_pin(PIN_TDO, false);
         configure_pin(PIN_SWCLK_TCK, false);
         configure_pin(PIN_SWDIO_TMS, true);
         configure_pin(PIN_TDI, false);
         configure_pin(PAD_NRESET, true);
+        configure_pin(PIN_ACTIVITY_LED, false);
 
         assign_to_fgpio(PORT_A, PIN_TDO);
         assign_to_fgpio(PORT_A, PIN_SWCLK_TCK);
         assign_to_fgpio(PORT_A, PIN_SWDIO_TMS);
         assign_to_fgpio(PORT_A, PIN_TDI);
+        assign_to_fgpio(PORT_A, PIN_ACTIVITY_LED);
         assign_to_fgpio(PORT_B, PIN_NRESET);
 
-        let output_a = SWDIO_TMS | TDI;
+        let output_a = (SWDIO_TMS | TDI) | activity_led_bit(false);
         let output_b = NRESET;
         write_do(PORT_A, output_a);
         write_do(PORT_B, output_b);
@@ -78,6 +99,10 @@ impl ProbePins {
             swdio_output_enabled: true,
             output_a,
             output_b,
+            activity_led_active: false,
+            activity_led_lit: false,
+            activity_led_next_toggle: 0,
+            activity_led_poll_count: 0,
             _owned: PhantomData,
         }
     }
@@ -129,6 +154,21 @@ impl ProbePins {
             self.output_b = output_b;
             write_do(PORT_B, self.output_b);
         }
+    }
+
+    #[inline(always)]
+    pub fn activity_led_busy(&mut self) {
+        match ACTIVITY_LED_MODE {
+            ActivityLedMode::SteadyBusy => self.set_activity_led(true),
+            ActivityLedMode::BlinkBusy => self.blink_activity_led(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn activity_led_idle(&mut self) {
+        self.activity_led_active = false;
+        self.activity_led_poll_count = 0;
+        self.set_activity_led(false);
     }
 
     #[inline(always)]
@@ -370,6 +410,7 @@ impl ProbePins {
 
             input += 4;
             done += 1;
+            self.poll_activity_led();
         }
 
         WriteBlockResult {
@@ -417,6 +458,7 @@ impl ProbePins {
 
             output += 4;
             done += 1;
+            self.poll_activity_led();
         }
 
         ReadBlockResult {
@@ -428,6 +470,7 @@ impl ProbePins {
     #[inline(always)]
     #[unsafe(link_section = ".fast")]
     pub fn swd_write_transfer_fast(&mut self, swd_request: u8, write_data: u32) -> TransferStatus {
+        self.poll_activity_led();
         self.swdio_output();
         let ack = self.swd_write_request_read_ack(swd_request);
         match ack {
@@ -465,6 +508,7 @@ impl ProbePins {
     #[inline(always)]
     #[unsafe(link_section = ".fast")]
     pub fn swd_read_transfer_fast(&mut self, swd_request: u8) -> crate::swj::TransferResult {
+        self.poll_activity_led();
         self.swdio_output();
         let ack = self.swd_write_request_read_ack(swd_request);
         match ack {
@@ -624,6 +668,46 @@ impl ProbePins {
     }
 
     #[inline(always)]
+    fn set_activity_led(&mut self, lit: bool) {
+        if self.activity_led_lit == lit {
+            return;
+        }
+        self.activity_led_lit = lit;
+        let output_a = (self.output_a & !ACTIVITY_LED) | activity_led_bit(lit);
+        self.output_a = output_a;
+        write_do(PORT_A, output_a);
+    }
+
+    #[inline(always)]
+    fn blink_activity_led(&mut self) {
+        let now = time::now_ticks();
+        if !self.activity_led_active {
+            self.activity_led_active = true;
+            self.activity_led_next_toggle =
+                now.wrapping_add(time::ticks_from_millis(ACTIVITY_LED_BLINK_TOGGLE_MS));
+            self.set_activity_led(true);
+            return;
+        }
+
+        if (now.wrapping_sub(self.activity_led_next_toggle) as i64) >= 0 {
+            self.activity_led_next_toggle =
+                now.wrapping_add(time::ticks_from_millis(ACTIVITY_LED_BLINK_TOGGLE_MS));
+            self.set_activity_led(!self.activity_led_lit);
+        }
+    }
+
+    #[inline(always)]
+    fn poll_activity_led(&mut self) {
+        if self.activity_led_poll_count != 0 {
+            self.activity_led_poll_count -= 1;
+            return;
+        }
+
+        self.activity_led_poll_count = ACTIVITY_LED_POLL_INTERVAL;
+        self.activity_led_busy();
+    }
+
+    #[inline(always)]
     fn delay_half(&self) {
         delay_half_count(self.half_period_delay);
     }
@@ -729,6 +813,16 @@ impl ProbeIo for ProbePins {
     #[inline(always)]
     fn current_pin_state(&self) -> u8 {
         ProbePins::current_pin_state(self)
+    }
+
+    #[inline(always)]
+    fn activity_led_busy(&mut self) {
+        ProbePins::activity_led_busy(self);
+    }
+
+    #[inline(always)]
+    fn activity_led_idle(&mut self) {
+        ProbePins::activity_led_idle(self);
     }
 
     #[inline(always)]
@@ -889,6 +983,14 @@ fn swd_write_delay_for_hz(hz: u32) -> u8 {
         0
     } else {
         swd_delay_for_hz(hz)
+    }
+}
+
+const fn activity_led_bit(lit: bool) -> u32 {
+    if lit == ACTIVITY_LED_ACTIVE_HIGH {
+        ACTIVITY_LED
+    } else {
+        0
     }
 }
 

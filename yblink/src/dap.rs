@@ -271,6 +271,14 @@ impl<P: ProbeIo> Dap<P> {
         response_len
     }
 
+    pub fn activity_led_busy(&mut self) {
+        self.swj.activity_led_busy();
+    }
+
+    pub fn activity_led_idle(&mut self) {
+        self.swj.activity_led_idle();
+    }
+
     fn dap_info(&mut self, request: &[u8], response: &mut [u8]) -> usize {
         let Some(&info) = request.get(1) else {
             response[1] = 0;

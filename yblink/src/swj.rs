@@ -22,6 +22,8 @@ pub trait ProbeIo {
     fn tck_cycle(&mut self);
     fn tck_sample_tdo(&mut self) -> bool;
     fn current_pin_state(&self) -> u8;
+    fn activity_led_busy(&mut self) {}
+    fn activity_led_idle(&mut self) {}
 
     #[inline(always)]
     fn jtag_cycle_tdi(&mut self, high: bool) -> bool {
@@ -583,6 +585,14 @@ impl<P: ProbeIo> Swj<P> {
 
     pub fn pin_state(&self) -> u8 {
         self.pins.current_pin_state()
+    }
+
+    pub fn activity_led_busy(&mut self) {
+        self.pins.activity_led_busy();
+    }
+
+    pub fn activity_led_idle(&mut self) {
+        self.pins.activity_led_idle();
     }
 
     #[allow(dead_code)]

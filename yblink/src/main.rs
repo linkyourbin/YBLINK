@@ -22,12 +22,15 @@ use embassy_usb::driver::{
 };
 use embassy_usb::{Builder, msos};
 use fast_gpio::ProbePins;
+use hal::time;
 use hal::usb::{EndpointState, UsbDriver};
 use hpm5301_hal as hal;
 use panic_halt as _;
 use serial::{SERIAL_USB_PACKET_SIZE, SerialUart, UART_RX_DMA_BUFFER_SIZE};
 use swj::Swj;
 use usb_dap::{CmsisDapV2Class, State as CmsisDapState};
+
+const ACTIVITY_LED_HOLD_MS: u64 = 300;
 
 #[unsafe(link_section = ".noncacheable")]
 static EP_STATE: EndpointState = EndpointState::new();
@@ -123,14 +126,16 @@ async fn main(_spawner: Spawner) {
         let (mut dap_reader, mut dap_writer) = cmsis_dap.split();
         dap_reader.wait_connection().await;
 
-        let pins = ProbePins::new(p.PA26, p.PA27, p.PA28, p.PA29, p.PB10);
+        let pins = ProbePins::new(p.PA26, p.PA27, p.PA28, p.PA29, p.PB10, p.PA10);
         let mut dap = Dap::new(Swj::new(pins));
 
         loop {
+            dap.activity_led_idle();
             let mut current = 0usize;
             let mut len = match dap_reader.read_packet(&mut requests[current]).await {
                 Ok(len) => len,
                 Err(_) => {
+                    dap.activity_led_idle();
                     dap_reader.wait_connection().await;
                     continue;
                 }
@@ -142,37 +147,43 @@ async fn main(_spawner: Spawner) {
                 let mut next_read = dap_reader.read_packet(next_request);
                 let next_read = unsafe { Pin::new_unchecked(&mut next_read) };
                 let mut next_read = next_read;
-                let _ = poll_once(next_read.as_mut()).await;
+                let mut next_result = poll_once(next_read.as_mut()).await;
 
+                dap.activity_led_busy();
                 let response_len = dap.process(&request[..len], &mut responses[current]);
-                if response_len == 0 {
-                    match next_read.await {
-                        Ok(next_len) => {
-                            current = next;
-                            len = next_len;
-                            continue;
-                        }
-                        Err(_) => break,
-                    }
-                }
 
-                if dap_writer
-                    .write_packet(&responses[current][..response_len])
-                    .await
-                    .is_err()
+                if response_len != 0
+                    && dap_writer
+                        .write_packet(&responses[current][..response_len])
+                        .await
+                        .is_err()
                 {
+                    dap.activity_led_idle();
                     break;
                 }
 
-                match next_read.await {
+                if next_result.is_none() {
+                    next_result = poll_once(next_read.as_mut()).await;
+                }
+
+                let next_read = match next_result.take() {
+                    Some(result) => result,
+                    None => await_with_activity_hold(next_read.as_mut(), &mut dap).await,
+                };
+
+                match next_read {
                     Ok(next_len) => {
                         current = next;
                         len = next_len;
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        dap.activity_led_idle();
+                        break;
+                    }
                 }
             }
 
+            dap.activity_led_idle();
             dap_reader.wait_connection().await;
         }
     };
@@ -194,6 +205,33 @@ async fn poll_once<F: Future>(mut future: Pin<&mut F>) -> Option<F::Output> {
         Poll::Pending => Poll::Ready(None),
     })
     .await
+}
+
+async fn await_with_activity_hold<F, P>(mut future: Pin<&mut F>, dap: &mut Dap<P>) -> F::Output
+where
+    F: Future,
+    P: swj::ProbeIo,
+{
+    let deadline = time::now_ticks().wrapping_add(time::ticks_from_millis(ACTIVITY_LED_HOLD_MS));
+    let ready = poll_fn(|cx| match future.as_mut().poll(cx) {
+        Poll::Ready(value) => Poll::Ready(Some(value)),
+        Poll::Pending => {
+            if (time::now_ticks().wrapping_sub(deadline) as i64) < 0 {
+                dap.activity_led_busy();
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                dap.activity_led_idle();
+                Poll::Ready(None)
+            }
+        }
+    })
+    .await;
+
+    match ready {
+        Some(value) => value,
+        None => future.await,
+    }
 }
 
 fn packet_pair<const N: usize>(
