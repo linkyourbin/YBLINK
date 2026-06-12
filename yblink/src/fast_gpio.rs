@@ -29,7 +29,8 @@ const ACTIVITY_LED: u32 = 1 << PIN_ACTIVITY_LED;
 
 const OUTPUT_MASK_A: u32 = SWCLK_TCK | SWDIO_TMS | TDI | ACTIVITY_LED;
 const OUTPUT_MASK_B: u32 = NRESET;
-const DEFAULT_SWJ_CLOCK_HZ: u32 = 1_000_000;
+const DEFAULT_SWJ_CLOCK_HZ: u32 = 8_000_000;
+const PROBE_RS_DEFAULT_SWJ_CLOCK_HZ: u32 = 1_000_000;
 const ACTIVITY_LED_ACTIVE_HIGH: bool = false;
 const ACTIVITY_LED_MODE: ActivityLedMode = ActivityLedMode::BlinkBusy;
 const ACTIVITY_LED_BLINK_TOGGLE_MS: u64 = 100;
@@ -108,6 +109,7 @@ impl ProbePins {
     }
 
     pub fn set_clock_hz(&mut self, hz: u32) {
+        let hz = normalize_swj_clock_hz(hz);
         self.half_period_delay = swd_delay_for_hz(hz);
         self.write_half_period_delay = swd_write_delay_for_hz(hz);
     }
@@ -980,6 +982,14 @@ fn swd_delay_for_hz(hz: u32) -> u8 {
 
 fn swd_write_delay_for_hz(hz: u32) -> u8 {
     swd_delay_for_hz(hz)
+}
+
+fn normalize_swj_clock_hz(hz: u32) -> u32 {
+    if hz == PROBE_RS_DEFAULT_SWJ_CLOCK_HZ {
+        DEFAULT_SWJ_CLOCK_HZ
+    } else {
+        hz
+    }
 }
 
 const fn activity_led_bit(lit: bool) -> u32 {
