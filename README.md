@@ -104,9 +104,3 @@ Flash it with an external probe:
 ```bash
 probe-rs download --chip HPM5301 --protocol jtag target/riscv32imafc-unknown-none-elf/release/yblink
 ```
-
-## Note
-
-The hardware version is not stable right now. Make sure that you connect `PA10` to a LED if you want to make your own `YBLINK`.
-
-`3V3 -> RES(1K~10K) -> LED -> PA10`
