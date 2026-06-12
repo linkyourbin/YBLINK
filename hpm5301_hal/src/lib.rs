@@ -180,10 +180,18 @@ pub struct Config {
 pub fn init(config: Config) -> Peripherals {
     let _pac = pac::Peripherals::take().expect("hpm5301_hal init called more than once");
     sysctl::init(config.sysctl);
+    enable_instruction_cache();
     time::init();
     embassy::init();
 
     unsafe { Peripherals::steal() }
+}
+
+fn enable_instruction_cache() {
+    // D-cache stays off until all USB/DMA buffers have explicit coherency handling.
+    unsafe {
+        andes_riscv::l1c::ic_enable();
+    }
 }
 
 /// Return peripheral tokens without initializing clocks or the HAL timebase.

@@ -979,11 +979,7 @@ fn swd_delay_for_hz(hz: u32) -> u8 {
 }
 
 fn swd_write_delay_for_hz(hz: u32) -> u8 {
-    if hz > 8_000_000 {
-        0
-    } else {
-        swd_delay_for_hz(hz)
-    }
+    swd_delay_for_hz(hz)
 }
 
 const fn activity_led_bit(lit: bool) -> u32 {

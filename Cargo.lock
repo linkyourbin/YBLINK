@@ -12,6 +12,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "andes-riscv"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8565440e8ab4c1f51b11215f053737b0ae37d8addb6358c22b727120b3a17a4"
+dependencies = [
+ "riscv",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -319,6 +328,7 @@ dependencies = [
 name = "hpm5301_hal"
 version = "0.1.0"
 dependencies = [
+ "andes-riscv",
  "embassy-time-driver",
  "embassy-usb-driver",
  "embedded-hal 1.0.0",

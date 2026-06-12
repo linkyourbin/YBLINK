@@ -143,6 +143,8 @@ impl<P: ProbeIo> Dap<P> {
         }
     }
 
+    #[inline(never)]
+    #[unsafe(link_section = ".fast")]
     pub fn process(&mut self, request: &[u8], response: &mut [u8]) -> usize {
         let Some(&command) = request.first() else {
             return 0;
@@ -351,6 +353,8 @@ impl<P: ProbeIo> Dap<P> {
         2
     }
 
+    #[inline(never)]
+    #[unsafe(link_section = ".fast")]
     fn execute_commands(&mut self, request: &[u8], response: &mut [u8]) -> usize {
         if request.len() < 2 {
             response[0] = ID_DAP_EXECUTE_COMMANDS;

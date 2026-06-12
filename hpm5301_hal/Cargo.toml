@@ -8,6 +8,7 @@ test = false
 bench = false
 
 [dependencies]
+andes-riscv = { workspace = true }
 embassy-time-driver = { workspace = true }
 embassy-usb-driver = { workspace = true }
 embedded-hal = { workspace = true }

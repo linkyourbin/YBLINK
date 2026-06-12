@@ -19,6 +19,7 @@ embassy-executor = "0.10.0"
 panic-halt = "1.0.0"
 riscv = "0.16.0"
 riscv-rt = "0.17.1"
+andes-riscv = "0.3.0"
 embedded-hal = "1.0.0"
 embassy-time = { version = "0.5.1", features = ["tick-hz-1_000_000"] }
 embassy-time-driver = { version = "0.2.2", features = ["tick-hz-1_000_000"] }
